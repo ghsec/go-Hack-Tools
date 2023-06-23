@@ -10,6 +10,7 @@ import (
 	"os"
 	"regexp"
 	"strings"
+	"sync"
 )
 
 var regexPatterns = []*regexp.Regexp{
@@ -69,6 +70,7 @@ func main() {
 
 	verbose := flag.Bool("v", false, "Enable verbose output")
 	proxy := flag.String("p", "", "Proxy address in the format http://host:port")
+	concurrency := flag.Int("c", 10, "Concurrency level")
 	flag.Parse()
 
 	scanner := bufio.NewScanner(os.Stdin)
@@ -88,124 +90,139 @@ func main() {
 
 	client := &http.Client{Transport: transport}
 
+	// Create a wait group to synchronize goroutines
+	var wg sync.WaitGroup
+
+	// Create a buffered channel to control the concurrency
+	semaphore := make(chan struct{}, *concurrency)
+
 	for scanner.Scan() {
 		rawURL := scanner.Text()
 
-		u, err := url.Parse(rawURL)
-		if err != nil {
-			fmt.Printf("Error parsing URL: %s\n", err)
-			continue
-		}
+		wg.Add(1) // Increment the wait group counter
 
-		// Test parameters
-		queryParams := u.Query()
-		for param, values := range queryParams {
-			for _, value := range values {
-				for _, payload := range payloads {
-					injectedValue := value + payload
+		go func(rawURL string) {
+			defer wg.Done() // Decrement the wait group counter when the goroutine completes
 
-					// Create a new URL object with the injected parameter
-					injectedURL := *u
-					injectedParams := url.Values{}
-					for p, v := range queryParams {
-						if p == param {
-							injectedParams[p] = []string{injectedValue}
-						} else {
-							injectedParams[p] = v
+			u, err := url.Parse(rawURL)
+			if err != nil {
+				fmt.Printf("Error parsing URL: %s\n", err)
+				return
+			}
+
+			// Test parameters
+			queryParams := u.Query()
+			for param, values := range queryParams {
+				for _, value := range values {
+					for _, payload := range payloads {
+						injectedValue := value + payload
+
+						// Create a new URL object with the injected parameter
+						injectedURL := *u
+						injectedParams := url.Values{}
+						for p, v := range queryParams {
+							if p == param {
+								injectedParams[p] = []string{injectedValue}
+							} else {
+								injectedParams[p] = v
+							}
 						}
+						injectedURL.RawQuery = injectedParams.Encode()
+
+						if *verbose {
+							fmt.Printf("Sending request to %s\n", injectedURL.String())
+						}
+
+						semaphore <- struct{}{} // Acquire a semaphore
+
+						go func() {
+							defer func() { <-semaphore }() // Release the semaphore
+
+							req, err := http.NewRequest("GET", injectedURL.String(), nil)
+							if err != nil {
+								fmt.Printf("Error creating request: %s\n", err)
+								return
+							}
+
+							resp, err := client.Do(req)
+							if err != nil {
+								fmt.Printf("Error requesting %s: %s\n", injectedURL.String(), err)
+								return
+							}
+							defer resp.Body.Close()
+
+							for _, pattern := range regexPatterns {
+								scanner := bufio.NewScanner(resp.Body)
+								for scanner.Scan() {
+									line := scanner.Text()
+									if pattern.MatchString(line) {
+										fmt.Printf("Vulnerable: %s\n", line)
+										return // Found vulnerability, stop goroutine execution
+									}
+								}
+							}
+						}()
 					}
-					injectedURL.RawQuery = injectedParams.Encode()
+				}
+			}
+
+			// Test path
+			pathSegments := strings.Split(u.Path, "/")
+			for i, segment := range pathSegments {
+				for _, payload := range payloads {
+					injectedSegment := segment + payload
+					pathSegments[i] = injectedSegment
+
+					// Create a new URL object with the injected path
+					injectedURL := *u
+					injectedURL.Path = strings.Join(pathSegments, "/")
 
 					if *verbose {
 						fmt.Printf("Sending request to %s\n", injectedURL.String())
 					}
 
-					req, err := http.NewRequest("GET", injectedURL.String(), nil)
-					if err != nil {
-						fmt.Printf("Error creating request: %s\n", err)
-						continue
-					}
+					semaphore <- struct{}{} // Acquire a semaphore
 
-					resp, err := client.Do(req)
-					if err != nil {
-						fmt.Printf("Error requesting %s: %s\n", injectedURL.String(), err)
-						continue
-					}
+					go func() {
+						defer func() { <-semaphore }() // Release the semaphore
 
-					body := bufio.NewScanner(resp.Body)
-					for body.Scan() {
-						line := body.Text()
+						req, err := http.NewRequest("GET", injectedURL.String(), nil)
+						if err != nil {
+							fmt.Printf("Error creating request: %s\n", err)
+							return
+						}
+
+						resp, err := client.Do(req)
+						if err != nil {
+							fmt.Printf("Error requesting %s: %s\n", injectedURL.String(), err)
+							return
+						}
+						defer resp.Body.Close()
+
 						for _, pattern := range regexPatterns {
-							if pattern.MatchString(line) {
-								fmt.Printf("[Vulnerable]: %s Requested URL: %s\n", line, injectedURL.String())
-								resp.Body.Close()
-								return // Found vulnerability, stop script execution
+							scanner := bufio.NewScanner(resp.Body)
+							for scanner.Scan() {
+								line := scanner.Text()
+								if pattern.MatchString(line) {
+									fmt.Printf("Vulnerable: %s\n", line)
+									return // Found vulnerability, stop goroutine execution
+								}
 							}
 						}
-					}
-
-					if body.Err() != nil {
-						fmt.Printf("Error reading response from %s: %s\n", injectedURL.String(), body.Err())
-					}
-
-					resp.Body.Close()
-				}
-			}
-		}
-
-		// Test path
-		pathSegments := strings.Split(u.Path, "/")
-		for i, segment := range pathSegments {
-			for _, payload := range payloads {
-				injectedSegment := segment + payload
-				pathSegments[i] = injectedSegment
-
-				// Create a new URL object with the injected path
-				injectedURL := *u
-				injectedURL.Path = strings.Join(pathSegments, "/")
-
-				if *verbose {
-					fmt.Printf("Sending request to %s\n", injectedURL.String())
+					}()
 				}
 
-				req, err := http.NewRequest("GET", injectedURL.String(), nil)
-				if err != nil {
-					fmt.Printf("Error creating request: %s\n", err)
-					continue
-				}
-
-				resp, err := client.Do(req)
-				if err != nil {
-					fmt.Printf("Error requesting %s: %s\n", injectedURL.String(), err)
-					continue
-				}
-
-				body := bufio.NewScanner(resp.Body)
-				for body.Scan() {
-					line := body.Text()
-					for _, pattern := range regexPatterns {
-						if pattern.MatchString(line) {
-							fmt.Printf("Vulnerable: %s Requested URL: %s\n", line, injectedURL.String())
-							resp.Body.Close()
-							return // Found vulnerability, stop script execution
-						}
-					}
-				}
-
-				if body.Err() != nil {
-					fmt.Printf("Error reading response from %s: %s\n", injectedURL.String(), body.Err())
-				}
-
-				resp.Body.Close()
+				// Reset the segment to its original value
+				pathSegments[i] = segment
 			}
 
-			// Reset the segment to its original value
-			pathSegments[i] = segment
-		}
+		}(rawURL)
 	}
+
+	// Wait for all goroutines to complete
+	wg.Wait()
 
 	if scanner.Err() != nil {
 		fmt.Printf("Error reading input: %s\n", scanner.Err())
 	}
 }
-
