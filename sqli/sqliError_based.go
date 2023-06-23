@@ -146,21 +146,27 @@ func main() {
 
 							resp, err := client.Do(req)
 							if err != nil {
-								fmt.Printf("Error requesting %s: %s\n", injectedURL.String(), err)
+								
 								return
 							}
-							defer resp.Body.Close()
 
-							for _, pattern := range regexPatterns {
-								scanner := bufio.NewScanner(resp.Body)
-								for scanner.Scan() {
-									line := scanner.Text()
+							body := bufio.NewScanner(resp.Body)
+							for body.Scan() {
+								line := body.Text()
+								for _, pattern := range regexPatterns {
 									if pattern.MatchString(line) {
-										fmt.Printf("Vulnerable: %s\n", line)
+										fmt.Printf("Vulnerable: %s Requested URL: %s\n", line, injectedURL.String())
+										resp.Body.Close()
 										return // Found vulnerability, stop goroutine execution
 									}
 								}
 							}
+
+							if body.Err() != nil {
+								fmt.Printf("Error reading response from %s: %s\n", injectedURL.String(), body.Err())
+							}
+
+							resp.Body.Close()
 						}()
 					}
 				}
@@ -194,21 +200,27 @@ func main() {
 
 						resp, err := client.Do(req)
 						if err != nil {
-							fmt.Printf("Error requesting %s: %s\n", injectedURL.String(), err)
+							
 							return
 						}
-						defer resp.Body.Close()
 
-						for _, pattern := range regexPatterns {
-							scanner := bufio.NewScanner(resp.Body)
-							for scanner.Scan() {
-								line := scanner.Text()
+						body := bufio.NewScanner(resp.Body)
+						for body.Scan() {
+							line := body.Text()
+							for _, pattern := range regexPatterns {
 								if pattern.MatchString(line) {
-									fmt.Printf("Vulnerable: %s\n", line)
+									fmt.Printf("Vulnerable: %s Requested URL: %s\n", line, injectedURL.String())
+									resp.Body.Close()
 									return // Found vulnerability, stop goroutine execution
 								}
 							}
 						}
+
+						if body.Err() != nil {
+							fmt.Printf("Error reading response from %s: %s\n", injectedURL.String(), body.Err())
+						}
+
+						resp.Body.Close()
 					}()
 				}
 
